@@ -1,4 +1,4 @@
--- NEXUS HUB 11.7 | MOBILE | ESP ROLES + AUTO RESET
+-- NEXUS HUB 11.8 | MOBILE | ROUND DATA + RESET RESUME
 -- Codigo local Luau para cliente Roblox. Sem URL, webhook, request, loadstring ou dependencias externas.
 -- Farm e ESP dependem da estrutura do jogo; coleta/identificacao nao sao garantidas.
 -- Construir a interface PRIMEIRO. Nao varrer o mapa na inicializacao.
@@ -16,7 +16,7 @@ if not pg then return end
 pcall(function()
     if type(_G.NexusMobileStop)=="function" then _G.NexusMobileStop() end
 end)
-for _,name in ipairs({"NexusMobile117","NexusErroInicializacao"}) do
+for _,name in ipairs({"NexusMobile118","NexusErroInicializacao"}) do
     local g=pg:FindFirstChild(name)
     if g then g:Destroy() end
 end
@@ -29,7 +29,7 @@ local S={tab="Farm",farm=false,method="Fast",speed=28,pause=.01,noclip=true,
     espAll=false,espInnocent=false,espSheriff=false,espMurder=false,coinEsp=false,
     names=true,distances=true,role="Desconhecido",roleSource="Sem dados",bag=0,bagMax=0,bagInfo="Aguardando coleta",bagSource="Nenhuma",resetting=false,resetAttempted=false,
     status="Pronto",scanned=0,candy=0,contacts=0,removed=0,reroutes=0,resets=0,seen=0,rolesFound=0,
-    lastError="Nenhum",fullBag=false,motion=true,theme=1,scale=1,stage="Menu aberto"}
+    lastError="Nenhum",fullBag=false,motion=true,theme=1,scale=1,stage="Menu aberto",resetReason="Aguardando sacola cheia",lastRoleSample=0}
 local live=true
 local function make(class, props, parent)
     local o=Instance.new(class)
@@ -50,7 +50,7 @@ local function btn(parent,title)
     return b
 end
 
-local screen=make("ScreenGui",{Name="NexusMobile117",ResetOnSpawn=false,DisplayOrder=540,
+local screen=make("ScreenGui",{Name="NexusMobile118",ResetOnSpawn=false,DisplayOrder=540,
     ZIndexBehavior=Enum.ZIndexBehavior.Sibling},pg)
 local win=round(make("Frame",{Name="Window",Size=UDim2.fromOffset(650,420),
     Position=UDim2.fromScale(.5,.5),AnchorPoint=Vector2.new(.5,.5),
@@ -61,7 +61,7 @@ local side=make("Frame",{Size=UDim2.new(0,177,1,0),BorderSizePixel=0,
 local rail=make("Frame",{Size=UDim2.new(1,0,0,3),BackgroundColor3=T.accent,BorderSizePixel=0},win)
 local title=txt(side,"NEXUS",21,T.white,true)
 title.Position=UDim2.fromOffset(15,13);title.Size=UDim2.fromOffset(145,26)
-local edition=txt(side,"NIGHTFALL  •  11.7",9,T.accent,true)
+local edition=txt(side,"NIGHTFALL  •  11.8",9,T.accent,true)
 edition.Position=UDim2.fromOffset(15,42);edition.Size=UDim2.fromOffset(155,16)
 local open=btn(screen,"N")
 open.Size=UDim2.fromOffset(45,45);open.Position=UDim2.new(0,10,.52,0)
@@ -171,6 +171,10 @@ local coinHighlights={}
 local roleBusy=false
 local roleUpdated=-100
 local roleRequest=0
+local roundModule,roundModuleSignal
+local moduleTriedAt=-100
+local moduleReadAt=-100
+local moduleLoading=false
 local function normalizeRole(r)
     if type(r)~="string" then return nil end
     r=string.lower(r):gsub("[%s_%-]", "")
@@ -189,7 +193,7 @@ local function roleOf(p)
     end
     if not direct and p.Team then direct=normalizeRole(p.Team.Name) end
     if direct then return direct end
-    if os.clock()-roleUpdated<=210 then
+    if os.clock()-roleUpdated<=65 then
         local r=roles[string.lower(p.Name)] or roles[tostring(p.UserId)]
         if r then return r end
     end
@@ -236,24 +240,83 @@ local function ingestRoles(data,source)
         S.roleSource=source..": nenhum papel reconhecido"
         return false
     end
-    roles=result
+    -- Eventos podem atualizar somente um jogador; nao apagar o restante do mapa.
+    for name,role in pairs(result) do roles[name]=role end
     roleUpdated=os.clock()
-    S.rolesFound=found
-    S.roleSource=source..": "..tostring(found).." papéis"
+    local recognized=0
+    for _,p in ipairs(Players:GetPlayers()) do
+        if roles[string.lower(p.Name)] or roles[tostring(p.UserId)] then recognized=recognized+1 end
+    end
+    S.rolesFound=recognized
+    S.roleSource=source..": "..tostring(recognized).." jogadores"
     if S.autoReset and S.fullBag and safeReset then safeReset() end
     return true
 end
+-- O MM2 pode manter os dados ativos no modulo de rodada do cliente.
+-- Ler esse modulo evita depender exclusivamente de um evento que pode nao existir.
+local function roundData()
+    local now=os.clock()
+    if not roundModule and now-moduleTriedAt>=4 then
+        moduleTriedAt=now
+        local modules=ReplicatedStorage:FindFirstChild("Modules")
+        local ms=modules and modules:FindFirstChild("CurrentRoundClient")
+        if not ms then ms=ReplicatedStorage:FindFirstChild("CurrentRoundClient",true) end
+        if ms and ms:IsA("ModuleScript") and not moduleLoading then
+            moduleLoading=true
+            task.spawn(function()
+                local ok,mod=pcall(require,ms)
+                if not live then return end
+                moduleLoading=false
+                if ok and type(mod)=="table" then
+                    roundModule=mod
+                    moduleReadAt=-100
+                    local change=mod.PlayerDataChanged
+                    local signal
+                    if typeof(change)=="RBXScriptSignal" then
+                        signal=change
+                    elseif typeof(change)=="Instance" and change:IsA("BindableEvent") then
+                        signal=change.Event
+                    elseif typeof(change)=="Instance" and change:IsA("RemoteEvent") then
+                        signal=change.OnClientEvent
+                    end
+                    if signal and not roundModuleSignal then
+                        roundModuleSignal=signal:Connect(function(...)
+                            if not live then return end
+                            moduleReadAt=-100
+                            for _,arg in ipairs({...}) do
+                                if type(arg)=="table" then pcall(ingestRoles,arg,"Mudanca na rodada") end
+                            end
+                        end)
+                    end
+                else
+                    S.roleSource="Modulo de rodada indisponivel"
+                end
+            end)
+        end
+    end
+    if roundModule and now-moduleReadAt>=.65 then
+        moduleReadAt=now
+        local ok,data=pcall(function()return roundModule.PlayerData end)
+        if ok and type(data)=="table" then
+            ingestRoles(data,"CurrentRoundClient")
+            return true
+        end
+    end
+    return roundModule~=nil and roleUpdated>0 and now-roleUpdated<8
+end
 local function updateRoles(force)
     local now=os.clock()
-    -- Dados recentes do evento valem durante a rodada: nao refazer a consulta toda hora.
-    if not force and now-roleUpdated<40 then return end
+    -- Checa o modulo local primeiro; muito mais rapido que RemoteFunction.
+    local localReady=roundData()
+    if localReady and not force then return end
+    if not force and now-roleUpdated<3 then return end
     if roleBusy or (not force and now-roleAt<8) then return end
     roleAt=now
     local remotes=ReplicatedStorage:FindFirstChild("Remotes")
     local gp=remotes and remotes:FindFirstChild("Gameplay")
     local getter=gp and gp:FindFirstChild("GetPlayerData")
     if not getter or not getter:IsA("RemoteFunction") then
-        if roleUpdated<0 then S.roleSource="Aguardando PlayerDataChanged" end
+        if roleUpdated<0 then S.roleSource="Dados de papéis não encontrados" end
         return
     end
     roleBusy=true
@@ -262,18 +325,16 @@ local function updateRoles(force)
     task.delay(5,function()
         if live and roleRequest==request and roleBusy then
             roleBusy=false
-            S.roleSource="GetPlayerData demorou; aguardando evento"
+            S.roleSource="Consulta lenta; tentando dados da rodada"
         end
     end)
     task.spawn(function()
         local ok,data=pcall(function() return getter:InvokeServer() end)
         if not live or request~=roleRequest then return end
-        if ok then
-            if not ingestRoles(data,"Consulta GetPlayerData") and roleUpdated<0 then
-                S.roleSource="Aguardando PlayerDataChanged"
-            end
+        if ok and type(data)=="table" then
+            ingestRoles(data,"GetPlayerData")
         elseif roleUpdated<0 then
-            S.roleSource="GetPlayerData falhou; aguardando evento"
+            S.roleSource="Papéis não disponíveis no cliente"
         end
         roleBusy=false
     end)
@@ -535,7 +596,12 @@ local function startFarm()
             local failures=0
             while live and S.farm and job==id do
                 local _,hum,rr=playerParts()
-                if not rr or not hum or hum.Health<=0 then
+                if S.fullBag or S.resetting then
+                    stopMove()
+                    locked=nil
+                    S.status="Sacola cheia: aguardando decisão do reset"
+                    task.wait(.12)
+                elseif not rr or not hum or hum.Health<=0 then
                     stopMove();locked=nil;task.wait(.15)
                 else
                     if not collectibleAvailable(locked) or (locked and (seenTargets[locked] or 0)>os.clock()) then
@@ -625,7 +691,7 @@ local function updateEsp()
             local role=roleOf(p)
             local show=espOn(role) and head~=nil
             local item=espObjects[p]
-            if item and (not show or item.character~=ch) then
+            if item and (not show or item.character~=ch or not item.mark.Parent or not item.tag.Parent) then
                 if item.mark then item.mark:Destroy() end
                 if item.tag then item.tag:Destroy() end
                 espObjects[p]=nil;item=nil
@@ -634,9 +700,9 @@ local function updateEsp()
                 local color=(role=="Murderer") and T.bad or (role=="Sheriff") and Color3.fromRGB(70,160,255)
                     or role=="Inocente" and T.good or T.accent
                 if not item then
-                    local mark=make("Highlight",{Name="NexusPlayer117",Adornee=ch,FillTransparency=.7,
+                    local mark=make("Highlight",{Name="NexusPlayer118",Adornee=ch,FillTransparency=.7,
                         OutlineTransparency=0,DepthMode=Enum.HighlightDepthMode.AlwaysOnTop},ch)
-                    local tag=make("BillboardGui",{Name="NexusLabel117",Adornee=head,
+                    local tag=make("BillboardGui",{Name="NexusLabel118",Adornee=head,
                         Size=UDim2.fromOffset(170,41),StudsOffset=Vector3.new(0,2.2,0),
                         AlwaysOnTop=true},ch)
                     local l=txt(tag,"",12,T.white,true)
@@ -664,34 +730,58 @@ local function updateEsp()
     S.seen=count
 end
 safeReset=function()
-    if not S.autoReset or not S.fullBag or S.resetting or S.resetAttempted then return end
+    if not S.autoReset or not S.fullBag then return end
+    if S.resetting or S.resetAttempted then return end
+    -- Nunca considerar papel desconhecido como Inocente.
     S.role=roleOf(me)
-    -- Nunca resetar se for Murderer ou se o papel não estiver confirmado.
-    if S.role~="Inocente" and S.role~="Sheriff" then
-        S.bagInfo="Sacola cheia; reset protegido ("..S.role..")"
+    if S.role=="Murderer" then
+        S.resetReason="Protegido: voce e Murderer"
+        S.bagInfo="Sacola cheia; sem reset no papel Murderer"
         return
     end
-    local _,h=playerParts()
-    if h and h.Health>0 then
-        S.resetting=true
-        S.resetAttempted=true
-        if S.farm then stopFarm() end
-        local ok,err=pcall(function() h.Health=0 end)
-        if ok then
-            S.resets=S.resets+1
-            S.bagInfo="Sacola cheia: reset solicitado"
-        else
-            S.lastError=tostring(err)
-            S.bagInfo="Reset falhou: "..tostring(err):sub(1,50)
-            S.resetting=false
-        end
-        task.delay(3,function()
-            if live and S.resetting and me.Character==h.Parent and h.Health>0 then
-                S.bagInfo="Reset nao confirmado pelo jogo"
-            end
-            if live then S.resetting=false end
-        end)
+    if S.role~="Inocente" and S.role~="Sheriff" then
+        S.resetReason="Bloqueado: papel nao confirmado"
+        S.bagInfo="Sacola cheia; aguardando saber seu papel"
+        return
     end
+    local char,h=playerParts()
+    if not char or not h or h.Health<=0 then
+        S.resetReason="Personagem nao disponivel"
+        return
+    end
+    S.resetting=true
+    S.resetAttempted=true
+    S.resetReason="Solicitando respawn como "..S.role
+    -- Nao desligar o Farm: suspende ao marcar fullBag e retorna apos respawn.
+    stopMove()
+    local oldChar=char
+    local ok,err=pcall(function() h.Health=0 end)
+    if ok then
+        S.resets=S.resets+1
+        S.bagInfo="Sacola cheia: reinicio solicitado"
+    else
+        S.lastError=tostring(err)
+        S.bagInfo="Reset falhou: "..tostring(err):sub(1,50)
+        S.resetReason="Erro ao solicitar reset"
+        S.resetting=false
+    end
+    -- Alguns jogos ignoram mudancas locais de Health: fazer somente uma
+    -- tentativa alternativa se o mesmo personagem continuar vivo.
+    if ok then task.delay(2.5,function()
+        if not live then return end
+        if me.Character==oldChar and h.Parent==oldChar and h.Health>0 then
+            pcall(function() oldChar:BreakJoints() end)
+            S.resetReason="Tentativa alternativa de respawn"
+        end
+    end) end
+    task.delay(5,function()
+        if not live then return end
+        if me.Character==oldChar then
+            S.resetting=false
+            S.resetReason="Respawn nao confirmado pelo servidor"
+            S.bagInfo="Reset solicitado, mas personagem nao renasceu"
+        end
+    end)
 end
 local function validBag(current,maxVal,source)
     if type(current)~="number" or type(maxVal)~="number" then return false end
@@ -700,6 +790,7 @@ local function validBag(current,maxVal,source)
     S.bag=current;S.bagMax=maxVal;S.fullBag=(current>=maxVal)
     if not S.fullBag then S.resetAttempted=false end
     S.bagSource=source or "Coleta"
+    if not S.fullBag then S.resetReason="Sacola nao esta cheia" end
     S.bagInfo=tostring(S.bag).." / "..tostring(S.bagMax).." ("..S.bagSource..")"
     if S.fullBag then safeReset() end
     return true
@@ -722,7 +813,7 @@ end
 -- Leitura alternativa da sacola pela interface, sem assumir 50/50 nem ler números de qualquer aba.
 local guiBagReadAt=-100
 local function readBagGui()
-    if not S.autoReset or os.clock()-guiBagReadAt<.45 then return end
+    if not S.autoReset or os.clock()-guiBagReadAt<.7 then return end
     guiBagReadAt=os.clock()
     local bestA,bestB,bestScore
     for _,o in ipairs(pg:GetDescendants()) do
@@ -749,8 +840,8 @@ local function readBagGui()
     if bestA and bestB then validBag(bestA,bestB,"HUD") end
 end
 listen(me.CharacterAdded,function()
-    S.bag=0;S.bagMax=0;S.fullBag=false;S.resetting=false;S.resetAttempted=false;S.bagInfo="Nova rodada/respawn"
-    roles={};roleUpdated=-100;roleAt=-100;S.rolesFound=0
+    S.bag=0;S.bagMax=0;S.fullBag=false;S.resetting=false;S.resetAttempted=false;S.bagInfo="Nova rodada/respawn";S.resetReason="Aguardando sacola cheia"
+    roles={};roleUpdated=-100;roleAt=-100;moduleReadAt=-100;S.rolesFound=0
     stopMove()
 end)
 
@@ -818,7 +909,7 @@ render=function()
         end)
         info("Fonte dos papéis",S.roleSource)
         info("Papéis recebidos",S.rolesFound)
-        addText("Papéis são exibidos apenas quando informados pelo jogo; sem confirmação aparece Desconhecido.")
+        addText("Fonte principal: dados da rodada CurrentRoundClient; alternativa: GetPlayerData e PlayerDataChanged. Sem informação: Desconhecido.")
         info("Jogadores desenhados",S.seen)
         action("Atualizar papéis", "Consultar papéis conhecidos do jogo", "BUSCAR",function()updateRoles(true)end)
     elseif S.tab=="Murderer" then
@@ -877,6 +968,7 @@ render=function()
         info("Fonte da sacola",S.bagSource)
         info("Seu papel",roleOf(me))
         info("Estado do Auto Reset",S.autoReset and (S.fullBag and "Cheia" or "Monitorando") or "Desligado")
+        info("Motivo do reset",S.resetReason)
         info("Contatos tentados",S.contacts)
         info("Doces detectados",S.scanned)
         info("Desvios",S.reroutes)
@@ -912,6 +1004,7 @@ local function shutdown()
     for _,c in ipairs(allConnections) do pcall(function()c:Disconnect()end) end
     if bagConn then bagConn:Disconnect() end
     if roleEventConn then roleEventConn:Disconnect() end
+    if roundModuleSignal then roundModuleSignal:Disconnect() end
     for _,c in ipairs(roundConns) do c:Disconnect() end
     if screen and screen.Parent then screen:Destroy() end
     _G.NexusMobileStop=nil
@@ -922,7 +1015,7 @@ listen(close.MouseButton1Click,shutdown)
 -- Menu aparece agora, independentemente de moedas/papéis do mapa.
 local ok,err=pcall(render)
 if not ok then S.lastError=tostring(err);S.status="Erro ao desenhar aba";subhead.Text=S.lastError:sub(1,70) end
-print("[Nexus 11.7] Menu aberto; funções pesadas iniciam em segundo plano.")
+print("[Nexus 11.8] Menu aberto; funções pesadas iniciam em segundo plano.")
 
 -- Consultas são iniciadas APÓS o menu aparecer, sem travar a UI.
 task.spawn(function()
@@ -934,9 +1027,15 @@ task.spawn(function()
             if not roleEventConn then
                 local ev=gp:FindFirstChild("PlayerDataChanged")
                 if ev and ev:IsA("RemoteEvent") then
-                    roleEventConn=ev.OnClientEvent:Connect(function(data)
-                        local ok,err=pcall(ingestRoles,data,"Evento PlayerDataChanged")
-                        if not ok then S.lastError="ESP: "..tostring(err) end
+                    roleEventConn=ev.OnClientEvent:Connect(function(...)
+                        local args={...}
+                        for _,data in ipairs(args) do
+                            if type(data)=="table" then
+                                local ok,err=pcall(ingestRoles,data,"PlayerDataChanged")
+                                if not ok then S.lastError="ESP: "..tostring(err) end
+                            end
+                        end
+                        moduleReadAt=-100
                     end)
                     S.roleSource="Evento PlayerDataChanged conectado"
                 end
@@ -947,6 +1046,7 @@ task.spawn(function()
                     if ev and ev:IsA("RemoteEvent") then
                         local conn=ev.OnClientEvent:Connect(function()
                             roles={}
+                            moduleReadAt=-100
                             roleUpdated=-100
                             roleAt=-100
                             S.rolesFound=0
@@ -980,6 +1080,9 @@ task.spawn(function()
             elseif next(espObjects) then clearEsp() end
         end)
         if not ok2 then S.lastError=tostring(er) end
+        if live and (S.autoReset or S.espAll or S.espMurder or S.espSheriff or S.espInnocent) then
+            subhead.Text="Papel: "..roleOf(me).."  |  Sacola: "..S.bag.."/"..S.bagMax.."  |  ESP: "..S.rolesFound
+        end
         task.wait(.7)
     end
 end)
